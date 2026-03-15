@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 from datetime import datetime
 import socket
-import ssl
 import whois
 import dns.resolver
 import requests
@@ -20,13 +19,16 @@ def check_key(key):
     if key not in API_KEYS:
         return False, "Invalid API Key. Please contact AKASH EXPLOITS."
     
-    expiry_date = datetime.strptime(API_KEYS[key]["expiry"], "%YYYY-%m-%d")
-    days_left = (expiry_date - datetime.now()).days
-    
-    if days_left < 0:
-        return False, "API Key Expired. Renewal required."
-    
-    return True, days_left
+    try:
+        expiry_date = datetime.strptime(API_KEYS[key]["expiry"], "%Y-%m-%d")
+        days_left = (expiry_date - datetime.now()).days
+        
+        if days_left < 0:
+            return False, "API Key Expired. Renewal required."
+        
+        return True, days_left
+    except Exception as e:
+        return False, f"Error checking key: {str(e)}"
 
 @app.route('/')
 def home():
@@ -55,52 +57,94 @@ def mail_info():
     if not email:
         return jsonify({"error": "Please provide ?mail= parameter"}), 400
 
+    # Validate email format
+    if '@' not in email or '.' not in email:
+        return jsonify({"error": "Invalid email format"}), 400
+
     try:
         domain = email.split("@")[-1].strip().lower()
 
         # --- MX RECORDS ---
+        mx_records = []
         try:
-            mx_records = [str(r.exchange).rstrip('.') for r in dns.resolver.resolve(domain, "MX")]
-        except Exception:
-            mx_records = ["No record found"]
+            mx_answers = dns.resolver.resolve(domain, "MX")
+            mx_records = [str(r.exchange).rstrip('.') for r in mx_answers]
+        except dns.resolver.NoAnswer:
+            mx_records = ["No MX records found"]
+        except dns.resolver.NXDOMAIN:
+            mx_records = ["Domain does not exist"]
+        except Exception as e:
+            mx_records = [f"Error: {str(e)}"]
 
         # --- DOMAIN IP ---
+        ip_addr = "Unknown"
         try:
             ip_addr = socket.gethostbyname(domain)
+        except socket.gaierror:
+            ip_addr = "Could not resolve domain"
         except Exception:
             ip_addr = "Unknown"
 
         # --- WHOIS INFO ---
+        registrar = "Unknown"
+        creation_date = "Unknown"
         try:
             w = whois.whois(domain)
-            registrar = w.registrar or "Unknown"
-            creation_date = str(w.creation_date[0]) if isinstance(w.creation_date, list) else str(w.creation_date)
+            registrar = w.registrar if w.registrar else "Unknown"
+            if w.creation_date:
+                if isinstance(w.creation_date, list):
+                    creation_date = str(w.creation_date[0])
+                else:
+                    creation_date = str(w.creation_date)
+            else:
+                creation_date = "Unknown"
         except Exception:
-            registrar = creation_date = "Unknown"
+            pass  # Keep default Unknown values
 
         # --- ISP + LOCATION ---
         isp = "Unknown"
         location = "Unknown"
-        if ip_addr != "Unknown":
+        if ip_addr != "Unknown" and ip_addr != "Could not resolve domain":
             try:
-                ipinfo = requests.get(f"http://ip-api.com/json/{ip_addr}", timeout=6).json()
-                isp = ipinfo.get("isp", "Unknown")
-                location = f"{ipinfo.get('city', 'Unknown')}, {ipinfo.get('country', 'Unknown')}"
+                # Using ip-api.com (free, no API key required)
+                ipinfo = requests.get(f"http://ip-api.com/json/{ip_addr}", timeout=5).json()
+                if ipinfo.get('status') == 'success':
+                    isp = ipinfo.get("isp", "Unknown")
+                    location = f"{ipinfo.get('city', 'Unknown')}, {ipinfo.get('country', 'Unknown')}"
+                else:
+                    isp = "Location lookup failed"
+                    location = "Location lookup failed"
+            except requests.exceptions.Timeout:
+                isp = "Location lookup timeout"
+                location = "Location lookup timeout"
             except Exception:
                 pass
+
+        # Determine provider based on MX records
+        provider = "Unknown"
+        if any('google.com' in mx or 'googlemail.com' in mx for mx in mx_records):
+            provider = "Google Gmail"
+        elif any('outlook.com' in mx or 'hotmail.com' in mx for mx in mx_records):
+            provider = "Microsoft Outlook"
+        elif any('yahoo.com' in mx for mx in mx_records):
+            provider = "Yahoo Mail"
+        elif any('protonmail.com' in mx for mx in mx_records):
+            provider = "ProtonMail"
+        elif any('zoho.com' in mx for mx in mx_records):
+            provider = "Zoho Mail"
 
         # --- RESPONSE ---
         return jsonify({
             "Developer": "AKASH EXPLOITS",
             "Subscription_Status": {
                 "Key_Owner": API_KEYS[user_key]["owner"],
-                "Days_Remaining": f"{days_remaining} Days",
+                "Days_Remaining": f"{days_remaining} Days" if days_remaining >= 0 else "Expired",
                 "Expiry_Date": API_KEYS[user_key]["expiry"]
             },
             "Data": {
                 "Email": email,
                 "Domain": domain,
-                "Provider": "Google Gmail" if "gmail" in domain else "Unknown",
+                "Provider": provider,
                 "MX_Records": mx_records,
                 "Domain_IP": ip_addr,
                 "Server_Location": location,
@@ -111,7 +155,7 @@ def mail_info():
         })
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
