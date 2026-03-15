@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 from datetime import datetime
 import socket
+import ssl
 import whois
 import dns.resolver
 import requests
@@ -44,10 +45,10 @@ def mail_info():
     email = request.args.get('mail')
     user_key = request.args.get('key')
 
+    # --- KEY VALIDATION ---
     if not user_key:
         return jsonify({"error": "API Key is missing"}), 403
 
-    # --- KEY VALIDATION ---
     is_valid, result = check_key(user_key)
     if not is_valid:
         return jsonify({"error": result}), 403
@@ -65,94 +66,137 @@ def mail_info():
         domain = email.split("@")[-1].strip().lower()
 
         # --- MX RECORDS ---
-        mx_records = []
         try:
-            mx_answers = dns.resolver.resolve(domain, "MX")
-            mx_records = [str(r.exchange).rstrip('.') for r in mx_answers]
-        except dns.resolver.NoAnswer:
-            mx_records = ["No MX records found"]
-        except dns.resolver.NXDOMAIN:
-            mx_records = ["Domain does not exist"]
-        except Exception as e:
-            mx_records = [f"Error: {str(e)}"]
+            mx_records = [str(r.exchange).rstrip('.') for r in dns.resolver.resolve(domain, "MX")]
+        except Exception:
+            mx_records = ["No record found"]
 
         # --- DOMAIN IP ---
-        ip_addr = "Unknown"
         try:
             ip_addr = socket.gethostbyname(domain)
-        except socket.gaierror:
-            ip_addr = "Could not resolve domain"
         except Exception:
             ip_addr = "Unknown"
+
+        # --- SSL ISSUER ---
+        ssl_issuer = "Unknown"
+        try:
+            ctx = ssl.create_default_context()
+            with socket.create_connection((domain, 443), timeout=5) as sock:
+                with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
+                    cert = ssock.getpeercert()
+                    issuer = dict(x[0] for x in cert.get("issuer", []))
+                    ssl_issuer = issuer.get("organizationName", "Unknown")
+        except Exception:
+            pass
 
         # --- WHOIS INFO ---
         registrar = "Unknown"
         creation_date = "Unknown"
+        expiration_date = "Unknown"
         try:
             w = whois.whois(domain)
-            registrar = w.registrar if w.registrar else "Unknown"
+            registrar = w.registrar or "Unknown"
+            
             if w.creation_date:
                 if isinstance(w.creation_date, list):
                     creation_date = str(w.creation_date[0])
                 else:
                     creation_date = str(w.creation_date)
-            else:
-                creation_date = "Unknown"
+            
+            if w.expiration_date:
+                if isinstance(w.expiration_date, list):
+                    expiration_date = str(w.expiration_date[0])
+                else:
+                    expiration_date = str(w.expiration_date)
         except Exception:
-            pass  # Keep default Unknown values
+            pass
 
         # --- ISP + LOCATION ---
         isp = "Unknown"
         location = "Unknown"
-        if ip_addr != "Unknown" and ip_addr != "Could not resolve domain":
+        if ip_addr != "Unknown":
             try:
-                # Using ip-api.com (free, no API key required)
-                ipinfo = requests.get(f"http://ip-api.com/json/{ip_addr}", timeout=5).json()
+                ipinfo = requests.get(f"http://ip-api.com/json/{ip_addr}", timeout=6).json()
                 if ipinfo.get('status') == 'success':
                     isp = ipinfo.get("isp", "Unknown")
                     location = f"{ipinfo.get('city', 'Unknown')}, {ipinfo.get('country', 'Unknown')}"
-                else:
-                    isp = "Location lookup failed"
-                    location = "Location lookup failed"
-            except requests.exceptions.Timeout:
-                isp = "Location lookup timeout"
-                location = "Location lookup timeout"
             except Exception:
                 pass
 
-        # Determine provider based on MX records
-        provider = "Unknown"
-        if any('google.com' in mx or 'googlemail.com' in mx for mx in mx_records):
-            provider = "Google Gmail"
-        elif any('outlook.com' in mx or 'hotmail.com' in mx for mx in mx_records):
-            provider = "Microsoft Outlook"
-        elif any('yahoo.com' in mx for mx in mx_records):
-            provider = "Yahoo Mail"
-        elif any('protonmail.com' in mx for mx in mx_records):
-            provider = "ProtonMail"
-        elif any('zoho.com' in mx for mx in mx_records):
-            provider = "Zoho Mail"
+        # --- DISPOSABLE DOMAIN CHECK ---
+        disposable_domains = [
+            "tempmail.com", "10minutemail.com", "yopmail.com", 
+            "guerrillamail.com", "mailinator.com", "temp-mail.org",
+            "throwawaymail.com", "fakeinbox.com", "tempinbox.com"
+        ]
+        disposable = "Yes" if domain in disposable_domains else "No"
 
-        # --- RESPONSE ---
-        return jsonify({
-            "Developer": "AKASH EXPLOITS",
-            "Subscription_Status": {
-                "Key_Owner": API_KEYS[user_key]["owner"],
-                "Days_Remaining": f"{days_remaining} Days" if days_remaining >= 0 else "Expired",
-                "Expiry_Date": API_KEYS[user_key]["expiry"]
-            },
-            "Data": {
-                "Email": email,
-                "Domain": domain,
-                "Provider": provider,
-                "MX_Records": mx_records,
-                "Domain_IP": ip_addr,
-                "Server_Location": location,
-                "ISP": isp,
-                "Registrar": registrar,
-                "Creation_Date": creation_date
+        # --- PROVIDER DETECTION ---
+        provider = "Unknown"
+        if "gmail.com" in domain:
+            provider = "Google Gmail"
+        elif "yahoo.com" in domain:
+            provider = "Yahoo Mail"
+        elif "outlook.com" in domain or "hotmail.com" in domain:
+            provider = "Microsoft Outlook"
+        elif "protonmail.com" in domain:
+            provider = "ProtonMail"
+        elif "zoho.com" in domain:
+            provider = "Zoho Mail"
+        elif "aol.com" in domain:
+            provider = "AOL Mail"
+        elif "mail.com" in domain:
+            provider = "Mail.com"
+
+        # --- BREACH CHECK ---
+        breaches = []
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+                "api-version": "3"
             }
-        })
+            hibp = requests.get(
+                f"https://haveibeenpwned.com/unifiedsearch/{email}",
+                headers=headers,
+                timeout=10
+            )
+            if hibp.status_code == 200:
+                data = hibp.json()
+                breaches = [b["Name"] for b in data.get("Breaches", [])]
+            elif hibp.status_code == 404:
+                breaches = []
+            else:
+                breaches = ["Error fetching data"]
+        except requests.exceptions.Timeout:
+            breaches = ["Request timeout"]
+        except Exception:
+            breaches = ["Error fetching data"]
+
+        # --- RESPONSE (Original structure maintained) ---
+        response_data = {
+            "Email": email,
+            "Domain": domain,
+            "Provider": provider,
+            "MX Records": mx_records,
+            "Domain IP": ip_addr,
+            "Server Location": location,
+            "ISP": isp,
+            "Registrar": registrar,
+            "Creation Date": creation_date,
+            "Expiration Date": expiration_date,
+            "SSL Issuer": ssl_issuer,
+            "Disposable": disposable,
+            "Breaches Found": breaches,
+            "Developer": "AKASH EXPLOITS",
+            "Subscription": {
+                "Key_Owner": API_KEYS[user_key]["owner"],
+                "Days_Remaining": f"{days_remaining} Days",
+                "Expiry_Date": API_KEYS[user_key]["expiry"]
+            }
+        }
+
+        return jsonify(response_data)
 
     except Exception as e:
         return jsonify({"error": f"Internal server error: {str(e)}"}), 500
@@ -162,3 +206,4 @@ if __name__ == '__main__':
     app.run(host='0.0.0.0', port=port, debug=False)
 
 # CREDIT: @AKASH_EXPLOITS
+# Based on original by @SHHACKERDEV404
